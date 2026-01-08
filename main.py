@@ -13,6 +13,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Store call context (issue description) keyed by call SID
+call_contexts = {}
+
 
 def load_prompt(file_name):
     dir_path = os.path.dirname(os.path.realpath(__file__))
@@ -57,11 +60,117 @@ if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN or not TWILIO_PHONE_NUMBER:
 
 @app.get("/", response_class=HTMLResponse)
 async def index_page():
-    return {"message": "Twilio Media Stream Server is running!"}
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>AI Call Agent</title>
+        <style>
+            * { box-sizing: border-box; }
+            body {
+                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                max-width: 500px;
+                margin: 50px auto;
+                padding: 20px;
+                background: #f5f5f5;
+            }
+            h1 { color: #333; margin-bottom: 30px; }
+            label {
+                display: block;
+                margin-bottom: 5px;
+                font-weight: 600;
+                color: #555;
+            }
+            input, textarea {
+                width: 100%;
+                padding: 12px;
+                margin-bottom: 20px;
+                border: 1px solid #ddd;
+                border-radius: 6px;
+                font-size: 16px;
+            }
+            textarea {
+                height: 150px;
+                resize: vertical;
+            }
+            button {
+                width: 100%;
+                padding: 14px;
+                background: #007bff;
+                color: white;
+                border: none;
+                border-radius: 6px;
+                font-size: 16px;
+                cursor: pointer;
+            }
+            button:hover { background: #0056b3; }
+            button:disabled { background: #ccc; cursor: not-allowed; }
+            #status {
+                margin-top: 20px;
+                padding: 15px;
+                border-radius: 6px;
+                display: none;
+            }
+            .success { background: #d4edda; color: #155724; }
+            .error { background: #f8d7da; color: #721c24; }
+        </style>
+    </head>
+    <body>
+        <h1>AI Call Agent</h1>
+        <form id="callForm">
+            <label for="phone">Phone Number to Call</label>
+            <input type="tel" id="phone" placeholder="+1234567890" required>
+
+            <label for="context">What's your issue?</label>
+            <textarea id="context" placeholder="Describe the issue you want resolved. Include any relevant details like account numbers, dates, or previous case numbers."></textarea>
+
+            <button type="submit" id="submitBtn">Start Call</button>
+        </form>
+        <div id="status"></div>
+
+        <script>
+            document.getElementById('callForm').addEventListener('submit', async (e) => {
+                e.preventDefault();
+                const btn = document.getElementById('submitBtn');
+                const status = document.getElementById('status');
+                const phone = document.getElementById('phone').value;
+                const context = document.getElementById('context').value;
+
+                btn.disabled = true;
+                btn.textContent = 'Calling...';
+                status.style.display = 'none';
+
+                try {
+                    const params = new URLSearchParams({ to_phone_number: phone });
+                    if (context) params.append('context', context);
+
+                    const res = await fetch('/make-call?' + params.toString(), { method: 'POST' });
+                    const data = await res.json();
+
+                    if (data.error) {
+                        status.className = 'error';
+                        status.textContent = 'Error: ' + data.error;
+                    } else {
+                        status.className = 'success';
+                        status.textContent = 'Call initiated! ID: ' + data.call_sid;
+                    }
+                } catch (err) {
+                    status.className = 'error';
+                    status.textContent = 'Failed to start call: ' + err.message;
+                }
+
+                status.style.display = 'block';
+                btn.disabled = false;
+                btn.textContent = 'Start Call';
+            });
+        </script>
+    </body>
+    </html>
+    """
 
 
 @app.post("/make-call")
-async def make_call(to_phone_number: str):
+async def make_call(to_phone_number: str, context: str = ""):
     """Make an outgoing call to the specified phone number."""
     if not to_phone_number:
         return {"error": "Phone number is required"}
@@ -73,8 +182,14 @@ async def make_call(to_phone_number: str):
             from_=TWILIO_PHONE_NUMBER,
         )
         print(f"Call initiated with SID: {call.sid}")
+
+        # Store the context for this call
+        if context:
+            call_contexts[call.sid] = context
+            print(f"Stored context for call {call.sid}: {context}")
     except Exception as e:
         print(f"Error initiating call: {e}")
+        return {"error": str(e)}
 
     return {"call_sid": call.sid}
 
@@ -82,12 +197,15 @@ async def make_call(to_phone_number: str):
 @app.api_route("/outgoing-call", methods=["GET", "POST"])
 async def handle_outgoing_call(request: Request):
     """Handle outgoing call and return TwiML response to connect to Media Stream."""
+    # Get call SID from Twilio's request
+    form_data = await request.form()
+    call_sid = form_data.get("CallSid", "")
+
     response = VoiceResponse()
-    response.say("This calls may be recorded for compliance purposes")
+    response.say("Please hold while I connect you to our support agent.")
     response.pause(length=1)
-    response.say("Connecting with Compliance Agent")
     connect = Connect()
-    connect.stream(url=f"wss://{request.url.hostname}/media-stream")
+    connect.stream(url=f"wss://{request.url.hostname}/media-stream?call_sid={call_sid}")
     response.append(connect)
     return HTMLResponse(content=str(response), media_type="application/xml")
 
@@ -98,6 +216,12 @@ async def handle_media_stream(websocket: WebSocket):
     print("Client connected")
     await websocket.accept()
 
+    # Get call SID from query params and retrieve context
+    call_sid = websocket.query_params.get("call_sid", "")
+    user_context = call_contexts.pop(call_sid, "") if call_sid else ""
+    if user_context:
+        print(f"Retrieved context for call {call_sid}: {user_context}")
+
     async with websockets.connect(
         "wss://api.openai.com/v1/realtime?model=gpt-4o-realtime-preview-2024-10-01",
         extra_headers={
@@ -105,7 +229,7 @@ async def handle_media_stream(websocket: WebSocket):
             "OpenAI-Beta": "realtime=v1",
         },
     ) as openai_ws:
-        await send_session_update(openai_ws)
+        await send_session_update(openai_ws, user_context)
         stream_sid = None
         session_id = None
 
@@ -177,15 +301,19 @@ async def handle_media_stream(websocket: WebSocket):
         await asyncio.gather(receive_from_twilio(), send_to_twilio())
 
 
-async def send_session_update(openai_ws):
+async def send_session_update(openai_ws, user_context=""):
     """Send session update to OpenAI WebSocket."""
+    instructions = SYSTEM_MESSAGE
+    if user_context:
+        instructions = f"{SYSTEM_MESSAGE}\n\n---\nUSER'S ISSUE:\n{user_context}\n---"
+
     session_update = {
         "type": "session.update",
         "session": {
             "input_audio_format": "g711_ulaw",
             "output_audio_format": "g711_ulaw",
             "voice": VOICE,
-            "instructions": SYSTEM_MESSAGE,
+            "instructions": instructions,
             "modalities": ["text", "audio"],
             "temperature": 0.2,
         },
